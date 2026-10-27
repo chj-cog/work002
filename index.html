@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>몰래 과자 먹기</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2b2118; overflow: hidden;
+    font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+  canvas { width: min(100vw, calc(100vh * 4 / 3)); aspect-ratio: 4 / 3; display: block; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="800" height="600"></canvas></div>
+<script>
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = 800, H = 600;
+const EMOJI = '"Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif';
+const KFONT = '"Malgun Gothic","Apple SD Gothic Neo",sans-serif';
+
+const SNACKS = [
+  { e: '🍪', n: '쿠키',     t: 1.2, p: 100 },
+  { e: '🍫', n: '초콜릿',   t: 1.5, p: 130 },
+  { e: '🥨', n: '프레첼',   t: 1.4, p: 120 },
+  { e: '🍩', n: '도넛',     t: 1.8, p: 160 },
+  { e: '🍭', n: '막대사탕', t: 2.0, p: 180 },
+  { e: '🍙', n: '삼각김밥', t: 2.3, p: 220 },
+];
+const BOARD_TEXT = [
+  '2x + 3 = 11', 'x = 4', '광합성: 빛 → 에너지', '임진왜란 1592년',
+  'a² + b² = c²', 'H₂O = 물', '주어 + 동사 + 목적어', '넓이 = ½ × 밑변 × 높이',
+  '조용히 할 것!!', '수업 중 간식 금지',
+];
+const CLASSMATES = ['#2a1d14', '#5a3b22', '#1c1c1c', '#7a4a1e'];
+
+// ---------- state ----------
+let state = 'title';          // title | help | play | over
+let time = 0, overAt = 0, helpAt = 0;
+let holding = false;
+let mouth = 0;                // 0 = hidden behind desk, 1 = at mouth
+let lastExposed = -99;
+let score = 0, lives = 3, level = 1, eaten = 0, combo = 0;
+let best = 0;
+try { best = +localStorage.getItem('snack-best') || 0; } catch (e) {}
+let snack = SNACKS[0], biteProg = 0, crunchT = 0;
+let teacher = { mode: 'write', t: 0, dur: 3 };
+let tx = 400;
+let lines = [], curLine = '', chalk = 0;
+let particles = [], popups = [];
+let shake = 0;
+let restrainHint = false;
+const GAME_TIME = 60;
+let timeLeft = GAME_TIME, endReason = '';
+
+// ---------- audio ----------
+let ac = null;
+function audio() {
+  if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (ac && ac.state === 'suspended') ac.resume();
+}
+function tone(freq, dur, type = 'sine', vol = 0.15, slide = 0) {
+  if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain(), n = ac.currentTime;
+  o.type = type; o.frequency.setValueAtTime(freq, n);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), n + dur);
+  g.gain.setValueAtTime(vol, n); g.gain.exponentialRampToValueAtTime(0.001, n + dur);
+  o.connect(g).connect(ac.destination); o.start(n); o.stop(n + dur);
+}
+function noise(dur, freq, vol) {
+  if (!ac) return;
+  const len = Math.floor(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = buf; f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = 1.5;
+  g.gain.value = vol;
+  s.connect(f).connect(g).connect(ac.destination); s.start();
+}
+const sfx = {
+  crunch: () => noise(0.07, 1500 + Math.random() * 2000, 0.5),
+  chalk:  () => noise(0.03, 4000 + Math.random() * 1500, 0.06),
+  hmm:    () => tone(180, 0.18, 'triangle', 0.12, -30),
+  caught: () => { tone(520, 0.12, 'square', 0.12); setTimeout(() => tone(260, 0.35, 'square', 0.12, -120), 120); },
+  done:   () => { tone(660, 0.08, 'sine', 0.15); setTimeout(() => tone(990, 0.12, 'sine', 0.15), 80); },
+  close:  () => tone(1200, 0.1, 'sine', 0.1, 400),
+  level:  () => [523, 659, 784].forEach((f, i) => setTimeout(() => tone(f, 0.12, 'sine', 0.14), i * 90)),
+};
+
+// ---------- helpers ----------
+const rand = (a, b) => a + Math.random() * (b - a);
+const ease = t => t * t * (3 - 2 * t);
+function popup(text, x, y, color = '#fff', size = 30) { popups.push({ text, x, y, color, size, t: 0 }); }
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function newSnack() { snack = SNACKS[Math.floor(Math.random() * SNACKS.length)]; biteProg = 0; }
+function snackPos() {
+  const k = ease(mouth);
+  return { x: 610 - 200 * k, y: 680 - 150 * k, s: 70 + 70 * k };
+}
+
+// difficulty
+const speedMul = () => Math.max(0.45, 1 - (level - 1) * 0.07);
+const fakeChance = () => Math.min(0.4, 0.08 + level * 0.04);
+
+function setMode(m) {
+  teacher.mode = m; teacher.t = 0;
+  if (m === 'write') {
+    // decide the next turn up front so we know when the teacher will actually look
+    teacher.dur = rand(1.3, 3.8) * speedMul();
+    teacher.next = Math.random() < fakeChance() ? 'fake' : 'warn';
+    teacher.nextDur = Math.max(0.3, rand(0.5, 0.85) * speedMul());
+  }
+  if (m === 'warn' || m === 'fake') { teacher.dur = teacher.nextDur; sfx.hmm(); }
+  if (m === 'look') {
+    teacher.dur = rand(0.4, 1.0);
+    restrainHint = false;
+    if (state === 'play' && mouth <= 0.3 && time - lastExposed < 0.35) {
+      const b = 50 * level;
+      score += b; popup(`아슬아슬! +${b}`, 400, 330, '#ffe066', 32); sfx.close();
+    }
+  }
+  if (m === 'angry') teacher.dur = 1.7;
+}
+
+function startGame() {
+  audio();
+  state = 'play'; score = 0; lives = 3; level = 1; eaten = 0; combo = 0;
+  mouth = 0; holding = false; lastExposed = -99; timeLeft = GAME_TIME;
+  particles = []; popups = [];
+  newSnack(); setMode('write');
+}
+
+function caught() {
+  lives--; combo = 0; shake = 0.5; sfx.caught();
+  setMode('angry');
+  popup('들켰다! 과자 압수!', 400, 330, '#ff6b6b', 36);
+  newSnack();
+}
+
+function finishSnack() {
+  eaten++; combo++;
+  const pts = snack.p * level + (combo - 1) * 20;
+  score += pts; sfx.done();
+  popup(`${snack.n} 꿀꺽! +${pts}`, 400, 440, '#7cf29c', 30);
+  if (combo >= 3) popup(`${combo} 콤보!`, 400, 400, '#ffb347', 24);
+  if (eaten % 3 === 0) { level++; sfx.level(); popup(`레벨 ${level}! 선생님이 예민해졌다`, 400, 300, '#9ad0ff', 28); }
+  newSnack();
+}
+
+function gameOver(reason) {
+  state = 'over'; overAt = time; holding = false; endReason = reason;
+  if (reason === 'time') sfx.level();
+  if (score > best) { best = score; try { localStorage.setItem('snack-best', best); } catch (e) {} }
+}
+
+// ---------- update ----------
+let chalkTick = 0;
+function update(dt) {
+  time += dt;
+  shake = Math.max(0, shake - dt);
+  for (const p of particles) { p.vy += 900 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const p of popups) p.t += dt;
+  popups = popups.filter(p => p.t < 1.3);
+
+  // board writing
+  if (teacher.mode === 'write') {
+    if (!curLine) {
+      if (lines.length >= 4) lines = [];
+      curLine = BOARD_TEXT[Math.floor(Math.random() * BOARD_TEXT.length)]; chalk = 0;
+    }
+    chalk += dt * 7;
+    chalkTick -= dt;
+    if (chalkTick <= 0) { chalkTick = 0.12; if (state === 'play') sfx.chalk(); }
+    if (chalk >= curLine.length + 2) { lines.push(curLine); curLine = ''; }
+  }
+  const wp = writePoint();
+  tx += (Math.min(650, Math.max(190, wp.x + 70)) - tx) * Math.min(1, dt * 3);
+
+  if (state !== 'play') {
+    // attract mode: the teacher just keeps writing
+    if (teacher.mode !== 'write') setMode('write');
+    teacher.t = 0;
+    mouth = Math.max(0, mouth - dt * 9);
+    return;
+  }
+
+  // class timer
+  const prevSec = Math.ceil(timeLeft);
+  timeLeft -= dt;
+  if (timeLeft <= 0) { timeLeft = 0; gameOver('time'); return; }
+  if (Math.ceil(timeLeft) < prevSec && prevSec <= 5) tone(880, 0.06, 'square', 0.08);
+
+  // hand / snack
+  // while the teacher is watching, a hidden snack stays hidden even if the button is held
+  const blocked = teacher.mode === 'look' && mouth <= 0.3;
+  if (blocked && holding && !restrainHint) { restrainHint = true; popup('지금은 꾹 참자... 😬', 400, 470, '#ffe066', 24); }
+  const target = holding && teacher.mode !== 'angry' && !blocked ? 1 : 0;
+  const sp = target > mouth ? 5 : 9;
+  mouth += Math.sign(target - mouth) * Math.min(Math.abs(target - mouth), sp * dt);
+  const exposed = mouth > 0.3;
+  if (exposed) lastExposed = time;
+
+  if (mouth > 0.9 && teacher.mode !== 'angry') {
+    biteProg += dt / snack.t;
+    crunchT -= dt;
+    if (crunchT <= 0) {
+      crunchT = rand(0.15, 0.24); sfx.crunch();
+      const sp2 = snackPos();
+      for (let i = 0; i < 4; i++) particles.push({ x: sp2.x + rand(-30, 30), y: sp2.y - 20, vx: rand(-120, 120), vy: rand(-250, -50), life: 0.8, c: ['#c58b4b', '#8b5a2b', '#e8c07a'][i % 3] });
+    }
+    if (biteProg >= 1) finishSnack();
+  }
+
+  // teacher brain
+  teacher.t += dt;
+  const T = teacher;
+  if (T.mode === 'write' && T.t >= T.dur) setMode(T.next);
+  else if (T.mode === 'warn' && T.t >= T.dur) setMode('look');
+  else if (T.mode === 'fake' && T.t >= T.dur) setMode('write');
+  else if (T.mode === 'look') {
+    if (exposed && T.t > 0.08) caught();
+    else if (T.t >= T.dur) setMode('write');
+  } else if (T.mode === 'angry' && T.t >= T.dur) {
+    if (lives <= 0) gameOver('caught'); else setMode('write');
+  }
+}
+
+function writePoint() {
+  ctx.font = `30px ${KFONT}`;
+  const row = lines.length;
+  const w = ctx.measureText(curLine.slice(0, Math.floor(chalk))).width;
+  return { x: 130 + w, y: 92 + row * 48 };
+}
+
+// ---------- draw ----------
+function drawRoom() {
+  // wall
+  ctx.fillStyle = '#e9dcc0'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#d8c8a6'; ctx.fillRect(0, 300, W, 300);
+  // clock
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(752, 60, 26, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 3; ctx.stroke();
+  const a = time * 0.5;
+  ctx.beginPath(); ctx.moveTo(752, 60); ctx.lineTo(752 + Math.cos(a) * 18, 60 + Math.sin(a) * 18);
+  ctx.moveTo(752, 60); ctx.lineTo(752 + Math.cos(a / 12) * 11, 60 + Math.sin(a / 12) * 11); ctx.stroke();
+  // board
+  ctx.fillStyle = '#8b5e34'; rr(92, 36, 616, 252, 8); ctx.fill();
+  ctx.fillStyle = '#2f5d3a'; ctx.fillRect(104, 48, 592, 228);
+  ctx.fillStyle = '#b08a5a'; ctx.fillRect(100, 282, 600, 10);
+  ctx.fillStyle = '#fff'; ctx.fillRect(140, 278, 22, 5); ctx.fillStyle = '#f7d774'; ctx.fillRect(170, 278, 18, 5);
+  // chalk text
+  ctx.font = `30px ${KFONT}`; ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  lines.forEach((l, i) => ctx.fillText(l, 130, 80 + i * 48));
+  if (curLine) ctx.fillText(curLine.slice(0, Math.floor(chalk)), 130, 80 + lines.length * 48);
+}
+
+function drawTeacher() {
+  const m = teacher.mode, x = tx, hy = 168;
+  const jacket = '#5b4a8a', skin = '#f2c9a0', hair = '#3b2a20';
+  // body
+  ctx.fillStyle = jacket; rr(x - 46, hy + 28, 92, 230, 22); ctx.fill();
+  ctx.lineCap = 'round'; ctx.lineWidth = 17; ctx.strokeStyle = jacket;
+  if (m === 'write') {
+    const wp = writePoint();
+    const hx = wp.x + 4, hyy = wp.y - 6 + Math.sin(time * 22) * 3;
+    ctx.beginPath(); ctx.moveTo(x - 34, hy + 48); ctx.lineTo((x - 34 + hx) / 2, hy + 70); ctx.lineTo(hx, hyy); ctx.stroke();
+    ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(hx, hyy, 9, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x + 36, hy + 48); ctx.lineTo(x + 44, hy + 130); ctx.stroke();
+  } else if (m === 'angry') {
+    const wag = Math.sin(time * 25) * 10;
+    ctx.beginPath(); ctx.moveTo(x - 36, hy + 48); ctx.lineTo(x - 44, hy + 130); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + 36, hy + 48); ctx.lineTo(x + 70, hy + 20 + wag); ctx.stroke();
+    ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(x + 72, hy + 14 + wag, 9, 0, 7); ctx.fill();
+    ctx.fillRect(x + 69, hy - 8 + wag, 6, 16);
+  } else {
+    ctx.beginPath(); ctx.moveTo(x - 36, hy + 48); ctx.lineTo(x - 44, hy + 130); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + 36, hy + 48); ctx.lineTo(x + 44, hy + 130); ctx.stroke();
+  }
+  // collar
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(x - 14, hy + 28); ctx.lineTo(x, hy + 48); ctx.lineTo(x + 14, hy + 28); ctx.fill();
+
+  // head
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x, hy, 32, 0, 7); ctx.clip();
+  ctx.fillStyle = skin; ctx.fillRect(x - 40, hy - 40, 80, 80);
+  if (m === 'write') {
+    ctx.fillStyle = hair; ctx.fillRect(x - 40, hy - 40, 80, 80);
+  } else if (m === 'warn' || m === 'fake') {
+    // head turning: back of the head still mostly visible, one eye peeking
+    ctx.fillStyle = hair; ctx.beginPath(); ctx.arc(x - 16, hy - 4, 33, 0, 7); ctx.fill();
+    ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(x + 22, hy + 1, 3.5, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x + 22, hy + 1, 8, 0, 7); ctx.stroke();
+  } else {
+    ctx.fillStyle = hair; ctx.beginPath(); ctx.arc(x, hy - 30, 32, 0, 7); ctx.fill();
+    if (m === 'angry') { ctx.fillStyle = 'rgba(255,60,60,0.35)'; ctx.fillRect(x - 40, hy - 40, 80, 80); }
+  }
+  ctx.restore();
+  if (m === 'write') {
+    ctx.fillStyle = skin;
+    ctx.beginPath(); ctx.arc(x - 32, hy + 3, 6, 0, 7); ctx.arc(x + 32, hy + 3, 6, 0, 7); ctx.fill();
+  }
+  if (m === 'look' || m === 'angry') {
+    const scan = m === 'look' ? Math.sin(time * 4) * 3 : 0;
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x - 12, hy + 2, 9, 0, 7); ctx.moveTo(x + 21, hy + 2); ctx.arc(x + 12, hy + 2, 9, 0, 7);
+    ctx.moveTo(x - 3, hy + 2); ctx.lineTo(x + 3, hy + 2); ctx.stroke();
+    ctx.fillStyle = '#222';
+    ctx.beginPath(); ctx.arc(x - 12 + scan, hy + 3, 3.5, 0, 7); ctx.arc(x + 12 + scan, hy + 3, 3.5, 0, 7); ctx.fill();
+    ctx.lineWidth = 3; ctx.beginPath();
+    if (m === 'angry') {
+      ctx.moveTo(x - 22, hy - 14); ctx.lineTo(x - 5, hy - 7); ctx.moveTo(x + 22, hy - 14); ctx.lineTo(x + 5, hy - 7); ctx.stroke();
+      ctx.fillStyle = '#7a1f1f'; ctx.beginPath(); ctx.ellipse(x, hy + 20, 9, 6 + Math.abs(Math.sin(time * 20)) * 3, 0, 0, 7); ctx.fill();
+    } else {
+      ctx.moveTo(x - 20, hy - 12); ctx.lineTo(x - 5, hy - 12); ctx.moveTo(x + 5, hy - 12); ctx.lineTo(x + 20, hy - 12);
+      ctx.moveTo(x - 8, hy + 19); ctx.lineTo(x + 8, hy + 19); ctx.stroke();
+    }
+  }
+  // bubbles
+  if (m === 'warn' || m === 'fake') bubble(x + 44, hy - 58, '흠...', '#333', 22);
+  if (m === 'look') bubble(x + 44, hy - 58, '👀', '#333', 24, EMOJI);
+  if (m === 'angry') bubble(x + 50, hy - 62, '거기! 뭐 먹니?!', '#c0392b', 22);
+}
+
+function bubble(x, y, text, color, size, font = KFONT) {
+  ctx.font = `bold ${size}px ${font}`;
+  const w = ctx.measureText(text).width + 24, h = size + 18;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+  rr(x, y - h / 2, w, h, 12); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + 10, y + h / 2 - 1); ctx.lineTo(x - 6, y + h / 2 + 14); ctx.lineTo(x + 24, y + h / 2 - 1); ctx.fill();
+  ctx.fillStyle = color; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, x + w / 2, y + 1);
+}
+
+function drawClassroomFront() {
+  // classmates (backs of heads)
+  const xs = [110, 300, 500, 690];
+  xs.forEach((cx, i) => {
+    const bob = Math.sin(time * 1.3 + i * 2) * 2;
+    ctx.fillStyle = ['#3c6e9e', '#9e3c5a', '#3c9e6e', '#9e7a3c'][i];
+    rr(cx - 70, 440 + bob, 140, 140, 40); ctx.fill();
+    ctx.fillStyle = CLASSMATES[i]; ctx.beginPath(); ctx.arc(cx, 410 + bob, 44, 0, 7); ctx.fill();
+  });
+  // my desk
+  ctx.fillStyle = '#b07a44';
+  ctx.beginPath(); ctx.moveTo(40, 520); ctx.lineTo(760, 520); ctx.lineTo(800, 600); ctx.lineTo(0, 600); ctx.fill();
+  ctx.fillStyle = '#8d5c2e'; ctx.fillRect(40, 516, 720, 8);
+  // propped-up textbook (the hiding spot)
+  ctx.fillStyle = '#c0392b'; rr(500, 470, 210, 120, 6); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = `bold 22px ${KFONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('수학 교과서', 605, 510);
+  ctx.fillStyle = '#962d22'; ctx.fillRect(500, 545, 210, 6);
+  // pencil
+  ctx.save(); ctx.translate(200, 560); ctx.rotate(-0.15);
+  ctx.fillStyle = '#f5c242'; ctx.fillRect(0, 0, 110, 12); ctx.fillStyle = '#f2c9a0';
+  ctx.beginPath(); ctx.moveTo(110, 0); ctx.lineTo(126, 6); ctx.lineTo(110, 12); ctx.fill(); ctx.restore();
+}
+
+function drawSnack() {
+  if (state !== 'play' && mouth <= 0) return;
+  const p = snackPos();
+  // hand
+  ctx.fillStyle = '#f2c9a0';
+  ctx.beginPath(); ctx.ellipse(p.x + p.s * 0.15, p.y + p.s * 0.45, p.s * 0.38, p.s * 0.3, -0.3, 0, 7); ctx.fill();
+  const chew = mouth > 0.9 ? Math.sin(time * 30) * 3 : 0;
+  const size = p.s * (1 - 0.55 * biteProg);
+  ctx.font = `${size}px ${EMOJI}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(snack.e, p.x + chew, p.y);
+}
+
+function drawHUD() {
+  ctx.fillStyle = 'rgba(0,0,0,0.45)'; rr(10, 8, 300, 40, 10); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = `bold 20px ${KFONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(`점수 ${score}`, 22, 28);
+  ctx.fillText(`Lv.${level}`, 170, 28);
+  ctx.font = `20px ${EMOJI}`;
+  ctx.fillText('❤️'.repeat(Math.max(0, lives)) + '🖤'.repeat(3 - Math.max(0, lives)), 225, 28);
+
+  // timer
+  const urgent = timeLeft <= 10;
+  ctx.fillStyle = urgent ? `rgba(200,30,30,${0.6 + Math.sin(time * 10) * 0.2})` : 'rgba(0,0,0,0.45)';
+  rr(560, 8, 150, 40, 10); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = `bold 22px ${KFONT}`; ctx.textAlign = 'center';
+  ctx.fillText(`⏰ ${Math.ceil(timeLeft)}초`, 635, 28);
+  ctx.fillStyle = urgent ? '#ffb3b3' : '#7cf29c'; ctx.fillRect(570, 42, 130 * (timeLeft / GAME_TIME), 3);
+  ctx.textAlign = 'left';
+
+  // snack progress
+  ctx.fillStyle = 'rgba(0,0,0,0.45)'; rr(10, 550, 240, 40, 10); ctx.fill();
+  ctx.font = `24px ${EMOJI}`; ctx.fillText(snack.e, 20, 571);
+  ctx.fillStyle = '#fff'; ctx.font = `16px ${KFONT}`; ctx.fillText(snack.n, 54, 571);
+  ctx.fillStyle = '#444'; rr(128, 562, 110, 16, 8); ctx.fill();
+  ctx.fillStyle = '#7cf29c'; rr(128, 562, Math.max(4, 110 * biteProg), 16, 8); ctx.fill();
+  if (combo >= 2) {
+    ctx.fillStyle = '#ffb347'; ctx.font = `bold 18px ${KFONT}`; ctx.fillText(`🔥 ${combo} 콤보`, 20, 70);
+  }
+}
+
+function drawDanger() {
+  const m = teacher.mode;
+  let a = 0;
+  if ((m === 'warn' || m === 'fake') && mouth > 0.3) a = 0.25 + Math.sin(time * 30) * 0.15;
+  if (m === 'angry') a = Math.max(0, 0.5 - teacher.t * 0.4);
+  if (a <= 0) return;
+  const g = ctx.createRadialGradient(400, 300, 200, 400, 300, 520);
+  g.addColorStop(0, 'rgba(255,0,0,0)'); g.addColorStop(1, `rgba(255,0,0,${a})`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+function drawOverlay(title, lines2, sub) {
+  ctx.fillStyle = 'rgba(20,14,8,0.72)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffe066'; ctx.font = `bold 50px ${KFONT}`; ctx.fillText(title, 400, 150);
+  ctx.fillStyle = '#fff'; ctx.font = `21px ${KFONT}`;
+  lines2.forEach((l, i) => ctx.fillText(l, 400, 235 + i * 38));
+  if (Math.sin(time * 5) > -0.3) { ctx.fillStyle = '#7cf29c'; ctx.font = `bold 26px ${KFONT}`; ctx.fillText(sub, 400, 500); }
+}
+
+const HELP_CARDS = [
+  { icon: '👆🍪', title: '꾹 누르기', color: '#7cf29c',
+    lines: ['스페이스바 / 마우스 / 터치', '누르고 있는 동안', '과자를 냠냠 먹어요'] },
+  { icon: '✋📕', title: '손 떼기', color: '#9ad0ff',
+    lines: ['손을 떼면 과자를', '교과서 뒤로 숨겨요', '숨기고 있으면 안전!'] },
+  { icon: '🧑‍🏫💬', title: '"흠..." 하면 위험!', color: '#ff6b6b',
+    lines: ['선생님이 멈칫하면', '곧 뒤를 돌아봐요', '들고 있으면 걸려요!'] },
+];
+function drawHelp() {
+  ctx.fillStyle = 'rgba(20,14,8,0.82)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffe066'; ctx.font = `bold 40px ${KFONT}`; ctx.fillText('조작 방법', 400, 62);
+  HELP_CARDS.forEach((c, i) => {
+    const x = 35 + i * 250, y = 110;
+    ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.strokeStyle = c.color; ctx.lineWidth = 3;
+    rr(x, y, 230, 250, 16); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.color; ctx.beginPath(); ctx.arc(x + 24, y + 24, 16, 0, 7); ctx.fill();
+    ctx.fillStyle = '#222'; ctx.font = `bold 18px ${KFONT}`; ctx.fillText(i + 1, x + 24, y + 25);
+    const bob = Math.sin(time * 4 + i) * 4;
+    ctx.font = `52px ${EMOJI}`; ctx.fillText(c.icon, x + 115, y + 80 + bob);
+    ctx.fillStyle = c.color; ctx.font = `bold 22px ${KFONT}`; ctx.fillText(c.title, x + 115, y + 145);
+    ctx.fillStyle = '#fff'; ctx.font = `16px ${KFONT}`;
+    c.lines.forEach((l, j) => ctx.fillText(l, x + 115, y + 180 + j * 24));
+    if (i < 2) { ctx.fillStyle = '#ffe066'; ctx.font = `bold 24px ${KFONT}`; ctx.fillText('▶', x + 240, y + 125); }
+  });
+  ctx.fillStyle = '#ddd'; ctx.font = `17px ${KFONT}`;
+  ctx.fillText('💡 멈칫만 하고 다시 칠판을 보는 "페이크"도 있어요', 400, 400);
+  ctx.fillText('💡 돌아보기 직전에 숨기면 "아슬아슬!" 보너스 · 과자 3개마다 레벨 업', 400, 430);
+  ctx.fillText('💡 선생님이 보고 있을 땐 눌러도 과자를 꺼내지 않아요', 400, 460);
+  ctx.fillText('💡 수업은 60초! 걸리면 과자 압수 + 목숨 ❤️ 감소 (총 3개)', 400, 490);
+  if (time - helpAt > 0.5 && Math.sin(time * 5) > -0.3) {
+    ctx.fillStyle = '#7cf29c'; ctx.font = `bold 26px ${KFONT}`; ctx.fillText('눌러서 시작!', 400, 545);
+  }
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-8, 8) * shake * 2, rand(-8, 8) * shake * 2);
+  drawRoom();
+  drawTeacher();
+  drawClassroomFront();
+  drawSnack();
+  for (const p of particles) { ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 6, 6); }
+  ctx.restore();
+  drawDanger();
+  for (const p of popups) {
+    ctx.globalAlpha = Math.min(1, (1.3 - p.t) * 2);
+    ctx.font = `bold ${p.size}px ${KFONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineWidth = 5; ctx.strokeStyle = '#000'; ctx.strokeText(p.text, p.x, p.y - p.t * 50);
+    ctx.fillStyle = p.color; ctx.fillText(p.text, p.x, p.y - p.t * 50);
+    ctx.globalAlpha = 1;
+  }
+  if (state === 'play') drawHUD();
+  if (state === 'title') drawOverlay('🍪 선생님 몰래 과자 먹기', [
+    '수업 시간, 배가 너무 고프다...',
+    '수업이 끝나는 60초 안에, 들키지 않고 과자를 최대한 많이 먹어라!',
+    '',
+    `최고 점수: ${best}`,
+  ], '눌러서 계속');
+  if (state === 'help') drawHelp();
+  if (state === 'over') drawOverlay(endReason === 'time' ? '🔔 수업 끝! 무사히 버텼다' : '교무실로 끌려갔다...', [
+    `점수: ${score}`,
+    `먹은 과자: ${eaten}개 · 레벨 ${level}`,
+    score >= best && score > 0 ? '🏆 새 최고 기록!' : `최고 점수: ${best}`,
+  ], time - overAt > 0.8 ? '눌러서 다시 하기' : '');
+}
+
+// ---------- input ----------
+function press() {
+  audio();
+  if (state === 'title') { state = 'help'; helpAt = time; return; }
+  if (state === 'help') { if (time - helpAt > 0.5) startGame(); return; }
+  if (state === 'over') { if (time - overAt > 0.8) startGame(); return; }
+  holding = true;
+}
+function release() { holding = false; }
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); if (!e.repeat) press(); }
+});
+window.addEventListener('keyup', e => { if (e.code === 'Space' || e.code === 'Enter') release(); });
+window.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+window.addEventListener('pointerup', release);
+window.addEventListener('pointercancel', release);
+window.addEventListener('blur', release);
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---------- loop ----------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
